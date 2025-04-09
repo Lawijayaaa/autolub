@@ -1,36 +1,61 @@
-import time, json, os
-from datetime import datetime, date
+import time, socket, json, random, threading
 import pandas as pd
-import tkinter as tk
-from tkinter import ttk
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-import matplotlib.pyplot as plt
-from pymodbus.client import ModbusSerialClient
+from toolbox import generate_domain
 from fuzzylogic.classes import Rule
-from toolbox import (
-    generate_domain, send_cmd, log_power_to_excel, read_power_meter
-)
+from datetime import datetime, date
+from pymodbus.client import ModbusSerialClient
+from openpyxl import Workbook, load_workbook
+from tkinter import *
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
 
-# ===================== Konfigurasi =====================
+# === Global Config ===
 client = ModbusSerialClient(port='/dev/ttyACM0', baudrate=9600)
+host = '192.168.1.192'
+port = 6000
 INVENTORY = '04 FF 0F'
-listNull = ['05', '00', '0F', 'FB', 'E2', 'A7']
+PRESET_Value = 0xFFFF
+POLYNOMIAL = 0x8408
 timeout = 30
+stat = 0
+listNull = ['05', '00', '0F', 'FB', 'E2', 'A7']
+randomify = False  # MODE TEST
 
-# Membership Functions
+# === Domain Fuzzy ===
 durasiOven = generate_domain("Durasi Oven (Menit)", 120, 1440, ["sangat_sebentar", "sebentar", "sedang", "lama", "sangat_lama"])
 pastLub = generate_domain("Rentang Lubrikasi Terakhir (Jam)", 12, 672, ["sangat_sebentar", "sebentar", "sedang", "lama", "sangat_lama"])
 lastLub = generate_domain("Durasi Lubrikasi Terakhir (Milisecond)", 50, 6000, ["tidak_spray", "sebentar", "sedang", "lama", "sangat_lama"])
 lubDur = generate_domain("Durasi Lubrikasi (Milisecond)", 20, 6000, ["tidak_spray", "sebentar", "sedang", "lama", "sangat_lama"])
 
-# Fuzzy Rules
+# === Aturan Fuzzy ===
 df = pd.read_csv("rulebases.csv")
 rule_dict = {(row["Durasi_Oven"], row["Lubrikasi_Terakhir"], row["Durasi_Terakhir"]): row["Durasi_Lubrikasi"] for _, row in df.iterrows()}
-rules = [Rule({(getattr(durasiOven, a), getattr(pastLub, b), getattr(lastLub, c)): getattr(lubDur, d)})
-         for (a, b, c), d in rule_dict.items()]
+rules = [Rule({(getattr(durasiOven, do), getattr(pastLub, lt), getattr(lastLub, dt)): getattr(lubDur, dl)})
+         for (do, lt, dt), dl in rule_dict.items()]
 final_rule = sum(rules)
 
-# ===================== Fungsi Utama =====================
+# === CRC untuk RFID ===
+def crc(cmd):
+    cmd = bytes.fromhex(cmd)
+    crc_val = PRESET_Value
+    for b in cmd:
+        crc_val ^= b
+        for _ in range(8):
+            crc_val = (crc_val >> 1) ^ POLYNOMIAL if crc_val & 0x0001 else crc_val >> 1
+    return cmd + bytes([(crc_val & 0xFF), (crc_val >> 8) & 0xFF])
+
+# === Komunikasi RFID ===
+def send_cmd(cmd):
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(2)
+            s.connect((host, port))
+            s.sendall(crc(cmd))
+            data = s.recv(64)
+            return [data.hex().upper()[i*2:i*2+2] for i in range(len(data))] if data else ['FF']
+    except:
+        return "ERROR"
+
 def scan_rfid():
     start_time = time.time()
     last_state = ""
@@ -40,147 +65,140 @@ def scan_rfid():
             if result == listNull:
                 print("Menunggu tag...")
             elif result == "ERROR":
-                print("Koneksi ke RFID gagal.")
+                print("RFID error")
             else:
-                resultInt = int((result[6] + result[7]), 16)
-                return resultInt
+                return int(result[6] + result[7], 16)
             last_state = result
-        time.sleep(0.04)
         if time.time() - start_time > timeout:
-            print("Timeout RFID. Reset.")
+            print("Timeout")
             return 999
+        time.sleep(0.05)
+
+# === Hitung Durasi Lubrikasi ===
+last_data_json = {}
 
 def calc_lub(idTag):
-    strJsonName = f"cart{idTag}.json"
-    with open(strJsonName, "r") as file:
+    global last_data_json
+    filename = f"cart{idTag}.json"
+    with open(filename, "r") as file:
         data = json.load(file)
-
     data["lastTS"] = datetime.fromisoformat(data["lastLubTS"])
     lastScan = round((datetime.now() - data["lastTS"]).total_seconds() / 60, 3)
     lastLubSpan = round((datetime.now() - datetime.fromisoformat(data["lastLubTS"])).total_seconds() / 3600, 3)
     lastLubDur = data["lastLubDur"]
 
-    print(f"Input 1 : {lastScan} Menit")
-    print(f"Input 2 : {lastLubSpan} Jam")
-    print(f"Input 3 : {lastLubDur} ms")
-
-    values = {durasiOven: lastScan, pastLub: lastLubSpan, lastLub: lastLubDur}
-    result = round(final_rule(values))
-    print(f"Output Lubrikasi: {result} ms")
-
+    result = round(final_rule({durasiOven: lastScan, pastLub: lastLubSpan, lastLub: lastLubDur}))
     data["lastTS"] = datetime.now().isoformat()
-    if result < 500:
-        result = 0
-        data["lastLubDur"] = 0
-    else:
-        data["lastLubDur"] = result
-        data["lastLubTS"] = datetime.now().isoformat()
+    data["lastLubTS"] = data["lastTS"]
+    data["lastLubDur"] = result if result >= 500 else 0
 
-    with open(strJsonName, "w") as file:
+    with open(filename, "w") as file:
         json.dump(data, file, indent=4)
 
-    log_cart_to_excel(idTag, data)
+    last_data_json = {
+        "Cart ID": idTag,
+        "lastTS": data["lastTS"],
+        "lastLubTS": data["lastLubTS"],
+        "lastLubDur": data["lastLubDur"]
+    }
+    log_rfid(idTag, last_data_json)
     return result
 
-def log_cart_to_excel(idTag, data):
-    filename = f"cart_log_{date.today()}.xlsx"
-    sheet = "CartEvent"
-    log_data = [
-        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        idTag,
-        data["lastTS"],
-        data["lastLubTS"],
-        data["lastLubDur"]
-    ]
-
+# === Logging Excel ===
+def init_excel():
+    today = date.today().strftime("%Y-%m-%d")
     try:
-        import openpyxl
-        wb = openpyxl.load_workbook(filename)
-        if sheet in wb.sheetnames:
-            ws = wb[sheet]
-        else:
-            ws = wb.create_sheet(sheet)
-            ws.append(["Waktu", "CartID", "lastTS", "lastLubTS", "lastLubDur"])
+        wb = load_workbook("log_data.xlsx")
     except FileNotFoundError:
-        import openpyxl
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = sheet
-        ws.append(["Waktu", "CartID", "lastTS", "lastLubTS", "lastLubDur"])
+        wb = Workbook()
+    if today not in wb.sheetnames:
+        ws1 = wb.create_sheet(title=today)
+        ws1.append(["CartID", "lastTS", "lastLubTS", "lastLubDur"])
+        ws2 = wb.create_sheet(title=f"{today}_power")
+        ws2.append(["Timestamp", "Voltage", "Current"])
+    wb.save("log_data.xlsx")
 
-    ws.append(log_data)
-    wb.save(filename)
+def log_rfid(cart_id, data):
+    wb = load_workbook("log_data.xlsx")
+    ws = wb[date.today().strftime("%Y-%m-%d")]
+    ws.append([cart_id, data["lastTS"], data["lastLubTS"], data["lastLubDur"]])
+    wb.save("log_data.xlsx")
 
-# ===================== GUI =====================
-class RealtimePlot:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Monitoring Tegangan dan Arus")
-        self.root.geometry("800x600")
+def log_power(voltage, current):
+    wb = load_workbook("log_data.xlsx")
+    ws = wb[f"{date.today().strftime('%Y-%m-%d')}_power"]
+    ws.append([datetime.now().isoformat(), voltage, current])
+    wb.save("log_data.xlsx")
 
-        self.fig, self.axs = plt.subplots(2, 1, figsize=(6, 4))
-        self.canvas = FigureCanvasTkAgg(self.fig, master=self.root)
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+# === GUI & Realtime Chart ===
+root = Tk()
+root.title("Monitoring Tegangan & Arus")
 
-        self.timestamps, self.v_ab, self.i_a = [], [], []
+status_label = Label(root, text="Status: ", font=("Arial", 14))
+status_label.pack()
 
-        self.update_plot()
+json_label = Label(root, text="Data JSON: ", font=("Courier", 10), justify=LEFT)
+json_label.pack()
 
-    def update_plot(self):
-        data = read_power_meter(client, ct_ratio=150)
-        if data:
-            ts, vab, vbc, vca, ia, ib, ic = data
-            self.timestamps.append(ts)
-            self.v_ab.append(vab)
-            self.i_a.append(ia)
+fig = Figure(figsize=(6, 3), dpi=100)
+ax = fig.add_subplot(111)
+line_v, = ax.plot([], [], label="Tegangan")
+line_i, = ax.plot([], [], label="Arus")
+ax.legend()
+ax.set_ylim(0, 500)
+ax.set_xlim(0, 100)
+canvas = FigureCanvasTkAgg(fig, master=root)
+canvas.get_tk_widget().pack()
 
-            # Max data points
-            if len(self.timestamps) > 60:
-                self.timestamps = self.timestamps[-60:]
-                self.v_ab = self.v_ab[-60:]
-                self.i_a = self.i_a[-60:]
+voltage_data, current_data = [], []
 
-            self.axs[0].clear()
-            self.axs[1].clear()
-            self.axs[0].plot(self.timestamps, self.v_ab, label='V_AB (Volt)', color='blue')
-            self.axs[1].plot(self.timestamps, self.i_a, label='I_A (Ampere)', color='red')
-            self.axs[0].legend()
-            self.axs[1].legend()
-            self.axs[0].set_ylabel("Volt")
-            self.axs[1].set_ylabel("Ampere")
-            self.axs[1].set_xlabel("Waktu")
+def update_graph():
+    global stat
+    try:
+        getPLC = client.read_holding_registers(address=502, count=1, slave=1)
+        stat = getPLC.registers[0]
+    except:
+        stat = 0
+    status_label.config(text=f"Status Kereta: {'ADA' if stat == 1 else 'TIDAK'} | Mode: {'Random' if randomify else 'Real'}")
 
-            self.fig.tight_layout()
-            self.canvas.draw()
+    if stat == 1:
+        idTag = scan_rfid()
+        if idTag != 999:
+            dur = calc_lub(idTag)
+            client.write_register(address=501, value=dur, slave=1)
 
-        log_power_to_excel(client, ct_ratio=150)
-        self.root.after(1000, self.update_plot)
-
-# ===================== Loop Utama =====================
-def main_loop():
-    prev_stat = 0
-    while True:
+    # Baca tegangan & arus
+    if randomify:
+        voltage = random.randint(200, 240)
+        current = round(random.uniform(0.5, 2.5), 2)
+    else:
         try:
-            getPLC = client.read_holding_registers(address=502, count=1, slave=1)
-            stat = getPLC.registers[0]
+            reg = client.read_holding_registers(address=0, count=2, slave=2)
+            voltage = reg.registers[0] / 10.0
+            current = reg.registers[1] / 100.0
         except:
-            stat = 0
+            voltage, current = 0, 0
 
-        print(f"Status PLC: {stat}")
-        if prev_stat == 0 and stat == 1:
-            print("Status berubah ke 1")
-            idTag = scan_rfid()
-            if idTag != 999:
-                durasi = calc_lub(idTag)
-                client.write_register(address=501, value=durasi, slave=1)
-        prev_stat = stat
-        time.sleep(1)
+    voltage_data.append(voltage)
+    current_data.append(current)
+    if len(voltage_data) > 100:
+        voltage_data.pop(0)
+        current_data.pop(0)
 
-# ===================== Start Program =====================
-if __name__ == "__main__":
-    import threading
-    root = tk.Tk()
-    app = RealtimePlot(root)
-    thread = threading.Thread(target=main_loop, daemon=True)
-    thread.start()
-    root.mainloop()
+    log_power(voltage, current)
+
+    line_v.set_ydata(voltage_data)
+    line_i.set_ydata(current_data)
+    line_v.set_xdata(range(len(voltage_data)))
+    line_i.set_xdata(range(len(current_data)))
+    ax.relim()
+    ax.autoscale_view()
+    canvas.draw()
+
+    json_label.config(text=f"Data Lubrikasi: {json.dumps(last_data_json, indent=2)}")
+    root.after(1000, update_graph)
+
+# === Main ===
+init_excel()
+update_graph()
+root.mainloop()
