@@ -95,13 +95,13 @@ def calc_lub(idTag):
         data = json.load(file)   
     #INPUT 1 RENTANG WAKTU SEJAK DETEKSI TERAKHIR (DALAM MENIT)
     data["lastTS"] = datetime.fromisoformat(data["lastLubTS"])
-    lastScan = (round(((datetime.now() - data["lastTS"]).total_seconds())*100))/100
-    lastScan = (round(lastScan / 0.06))/1000
+    lastScan = round((datetime.now() - data["lastTS"]).total_seconds())
+    lastScan = (round((lastScan / 60) * 1000))/1000
     print(f"Input 1 : {lastScan} Menit")
     #INPUT 2 RENTANG WAKTU SEJAK LUBRIKASI TERAKHIR (DALAM JAM)
     data["lastLubTS"] = datetime.fromisoformat(data["lastLubTS"])
-    lastLubSpan = (round((((datetime.now() - data["lastLubTS"]).total_seconds())*100)))/100
-    lastLubSpan = (round(lastLubSpan / 3.6))/1000
+    lastLubSpan = round((datetime.now() - data["lastLubTS"]).total_seconds())
+    lastLubSpan = (round((lastLubSpan / 3600) * 1000))/1000
     print(f"Input 2 : {lastLubSpan} Jam")
     #INPUT 3 DURASI LUBRIKASI TERAKHIR (DALAM MILIDETIK)
     lastLubDur = data["lastLubDur"]
@@ -128,7 +128,8 @@ def main():
         prox_stat = input("Tekan 1 untuk melanjutkan")
         if prox_stat == "1":
             idTag = scan_rfid()
-            lubDur = calc_lub(idTag)
-            print(lubDur)
+            if idTag != 999:
+                lubDur = calc_lub(idTag)
+                print(lubDur)
 
 main()
