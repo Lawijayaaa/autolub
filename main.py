@@ -3,6 +3,9 @@ import pandas as pd
 from toolbox import generate_domain
 from fuzzylogic.classes import Rule
 from datetime import datetime
+from pymodbus.client import ModbusSerialClient
+
+client = ModbusSerialClient(port='/dev/ttyACM0', baudrate=9600)
 
 host = '192.168.1.192'
 port = 6000
@@ -125,11 +128,17 @@ def calc_lub(idTag):
 
 def main():
     while True:
-        prox_stat = input("Tekan 1 untuk melanjutkan")
-        if prox_stat == "1":
+        try:
+            getPLC = client.read_holding_registers(address=502, count=1, slave=1)
+            stat = getPLC[0]
+        except:
+            stat = 0
+
+        if stat == "1":
             idTag = scan_rfid()
             if idTag != 999:
                 lubDur = calc_lub(idTag)
                 print(lubDur)
+                writePLC = client.write_register(address=501, value=lubDur, slave=1)
 
 main()
