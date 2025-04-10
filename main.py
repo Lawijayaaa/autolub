@@ -61,6 +61,7 @@ def scan_rfid():
                 print("Menunggu tag...")
             elif result == "ERROR":
                 print("Koneksi RFID error.")
+                return 17
             else:
                 return int(result[6] + result[7], 16)
             last_state = result
@@ -133,10 +134,9 @@ def read_power_meter():
 def main():
     prev_stat = 0
     while True:
-        try:
-            stat = client.read_holding_registers(502, 1, slave=1).registers[0]
-        except:
-            stat = 0
+        
+        stat = client.read_holding_registers(address=502, count=1, slave=1).registers[0]
+        print("baca stat plc")
 
         voltage, current = read_power_meter()
 
